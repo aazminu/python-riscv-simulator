@@ -9,8 +9,44 @@ from .isa_rv32i import (
     decode_rv32i,
     evaluate_branch,
     execute_alu,
+    sign_extend,
+    to_i32,
     to_u32,
 )
+
+
+def _read_mem(dmem: Dict[int, int], addr: int, funct3: int) -> int:
+    word_addr = addr & ~0x3
+    byte_offset = addr & 0x3
+    word = dmem.get(word_addr, 0)
+    if funct3 == 0x0:  # LB
+        b = (word >> (8 * byte_offset)) & 0xFF
+        return to_u32(sign_extend(b, 8))
+    if funct3 == 0x4:  # LBU
+        return (word >> (8 * byte_offset)) & 0xFF
+    if funct3 == 0x1:  # LH
+        shift = 8 * (byte_offset & ~0x1)
+        h = (word >> shift) & 0xFFFF
+        return to_u32(sign_extend(h, 16))
+    if funct3 == 0x5:  # LHU
+        shift = 8 * (byte_offset & ~0x1)
+        return (word >> shift) & 0xFFFF
+    return to_u32(word)
+
+
+def _write_mem(dmem: Dict[int, int], addr: int, val: int, funct3: int) -> None:
+    word_addr = addr & ~0x3
+    byte_offset = addr & 0x3
+    if funct3 == 0x0:  # SB
+        shift = 8 * byte_offset
+        cur = dmem.get(word_addr, 0)
+        dmem[word_addr] = to_u32((cur & ~(0xFF << shift)) | ((val & 0xFF) << shift))
+    elif funct3 == 0x1:  # SH
+        shift = 8 * (byte_offset & ~0x1)
+        cur = dmem.get(word_addr, 0)
+        dmem[word_addr] = to_u32((cur & ~(0xFFFF << shift)) | ((val & 0xFFFF) << shift))
+    else:  # SW
+        dmem[word_addr] = to_u32(val)
 
 
 @dataclass(frozen=True)
@@ -67,18 +103,25 @@ class SingleCycleCore:
         elif inst.opcode == 0x13:  # I-type
             res = execute_alu(inst, v1, inst.imm)
             self._write_reg(inst.rd, res)
-        elif inst.mem_read:  # LW
+        elif inst.opcode == 0x37:  # LUI
+            self._write_reg(inst.rd, inst.imm)
+        elif inst.opcode == 0x17:  # AUIPC
+            self._write_reg(inst.rd, execute_alu(inst, self.pc, inst.imm))
+        elif inst.mem_read:  # LB, LH, LW, LBU, LHU
             addr = execute_alu(inst, v1, inst.imm)
-            self._write_reg(inst.rd, self.dmem.get(addr, 0))
-        elif inst.mem_write:  # SW
+            self._write_reg(inst.rd, _read_mem(self.dmem, addr, inst.funct3))
+        elif inst.mem_write:  # SB, SH, SW
             addr = execute_alu(inst, v1, inst.imm)
-            self.dmem[addr] = to_u32(v2)
+            _write_mem(self.dmem, addr, v2, inst.funct3)
         elif inst.is_branch:
             if evaluate_branch(inst, v1, v2):
                 next_pc = self.pc + inst.imm
-        elif inst.is_jump:  # JAL
+        elif inst.is_jump:  # JAL or JALR
             self._write_reg(inst.rd, self.pc + 4)
-            next_pc = self.pc + inst.imm
+            if inst.opcode == 0x67:  # JALR
+                next_pc = (to_i32(v1) + inst.imm) & ~1
+            else:
+                next_pc = self.pc + inst.imm
 
         self.pc = next_pc
         self.retired += 1
@@ -86,8 +129,7 @@ class SingleCycleCore:
     def run(self, max_cycles: int = 2000) -> CorePerformanceMetrics:
         while not self.halted and self.cycles < max_cycles:
             self.step()
-        # Account for final drain cycle parity with reference testbenches
-        total_cycles = self.cycles + 1
+        total_cycles = self.cycles
         cpi = total_cycles / max(self.retired, 1)
         ipc = self.retired / max(total_cycles, 1)
         return CorePerformanceMetrics(
@@ -141,10 +183,10 @@ class FiveStagePipelinedCore:
             self.regs[rd] = to_u32(val)
         self.regs[0] = 0
 
-    def _resolve_operand(self, reg_idx: int, raw_val: int) -> int:
+    def _resolve_operand(self, reg_idx: int, raw_val: int, from_id_stage: bool = False) -> int:
         if reg_idx == 0:
             return 0
-        # Priority 1: EX/MEM forwarding (youngest in-flight instruction)
+        # Priority 1: EX/MEM forwarding (youngest in-flight ALU producer)
         if (
             self.ex_mem.valid
             and self.ex_mem.inst.reg_write
@@ -153,14 +195,19 @@ class FiveStagePipelinedCore:
         ):
             self.forwarding_events += 1
             return self.ex_mem.alu_out
-        # Priority 2: MEM/WB forwarding
-        if self.mem_wb.valid and self.mem_wb.inst.reg_write and self.mem_wb.inst.rd == reg_idx:
+        # Priority 2: MEM/WB forwarding (needed in EX since ID/EX latched before split-cycle WB)
+        if (
+            not from_id_stage
+            and self.mem_wb.valid
+            and self.mem_wb.inst.reg_write
+            and self.mem_wb.inst.rd == reg_idx
+        ):
             self.forwarding_events += 1
             return self.mem_wb.mem_data if self.mem_wb.inst.mem_read else self.mem_wb.alu_out
         return raw_val
 
     def _uses_rs1(self, inst: DecodedInstruction) -> bool:
-        return inst.opcode in (0x33, 0x13, 0x03, 0x23, 0x63)
+        return inst.opcode in (0x33, 0x13, 0x03, 0x23, 0x63, 0x67)
 
     def _uses_rs2(self, inst: DecodedInstruction) -> bool:
         return inst.opcode in (0x33, 0x23, 0x63)
@@ -193,9 +240,9 @@ class FiveStagePipelinedCore:
             mem_read_val = 0
             if not m_inst.is_halt:
                 if m_inst.mem_read:
-                    mem_read_val = self.dmem.get(self.ex_mem.alu_out, 0)
+                    mem_read_val = _read_mem(self.dmem, self.ex_mem.alu_out, m_inst.funct3)
                 elif m_inst.mem_write:
-                    self.dmem[self.ex_mem.alu_out] = to_u32(self.ex_mem.v2)
+                    _write_mem(self.dmem, self.ex_mem.alu_out, self.ex_mem.v2, m_inst.funct3)
             next_mem_wb = _PipeLatch(
                 valid=True,
                 pc=self.ex_mem.pc,
@@ -211,10 +258,14 @@ class FiveStagePipelinedCore:
             if x_inst.is_halt:
                 next_ex_mem = _PipeLatch(valid=True, pc=self.id_ex.pc, inst=x_inst)
             else:
-                op1 = self._resolve_operand(x_inst.rs1, self.id_ex.v1)
-                op2_reg = self._resolve_operand(x_inst.rs2, self.id_ex.v2)
+                op1 = self._resolve_operand(x_inst.rs1, self.id_ex.v1) if self._uses_rs1(x_inst) else 0
+                op2_reg = self._resolve_operand(x_inst.rs2, self.id_ex.v2) if self._uses_rs2(x_inst) else 0
                 if x_inst.is_jump:
                     alu_res = self.id_ex.pc + 4
+                elif x_inst.opcode == 0x37:  # LUI
+                    alu_res = x_inst.imm
+                elif x_inst.opcode == 0x17:  # AUIPC
+                    alu_res = execute_alu(x_inst, self.id_ex.pc, x_inst.imm)
                 elif x_inst.opcode == 0x33:
                     alu_res = execute_alu(x_inst, op1, op2_reg)
                 else:
@@ -232,7 +283,8 @@ class FiveStagePipelinedCore:
         stall_pipeline = False
         if self.if_id.valid and not self.if_id.inst.is_halt:
             d_inst = self.if_id.inst
-            # Load-use hazard: LW in ID/EX whose rd is needed by instruction in IF/ID
+            needs_id_resolve = d_inst.is_branch or d_inst.opcode == 0x67
+            # Load-use hazard: load in ID/EX whose rd is needed by instruction in IF/ID
             if (
                 self.id_ex.valid
                 and self.id_ex.inst.mem_read
@@ -244,18 +296,16 @@ class FiveStagePipelinedCore:
             ):
                 stall_pipeline = True
                 self.load_use_stalls += 1
-            # Branch in ID waiting on ALU producer currently in ID/EX or LW in EX/MEM
-            if d_inst.is_branch:
+            # Branch or JALR in ID waiting on ALU producer currently in ID/EX or load in EX/MEM
+            elif needs_id_resolve:
                 if (
                     self.id_ex.valid
                     and self.id_ex.inst.reg_write
                     and self.id_ex.inst.rd != 0
-                    and d_inst.rs1 in (self.id_ex.inst.rd,)
-                ) or (
-                    self.id_ex.valid
-                    and self.id_ex.inst.reg_write
-                    and self.id_ex.inst.rd != 0
-                    and d_inst.rs2 in (self.id_ex.inst.rd,)
+                    and (
+                        (self._uses_rs1(d_inst) and d_inst.rs1 == self.id_ex.inst.rd)
+                        or (self._uses_rs2(d_inst) and d_inst.rs2 == self.id_ex.inst.rd)
+                    )
                 ):
                     stall_pipeline = True
                     self.load_use_stalls += 1
@@ -263,7 +313,10 @@ class FiveStagePipelinedCore:
                     self.ex_mem.valid
                     and self.ex_mem.inst.mem_read
                     and self.ex_mem.inst.rd != 0
-                    and (d_inst.rs1 == self.ex_mem.inst.rd or d_inst.rs2 == self.ex_mem.inst.rd)
+                    and (
+                        (self._uses_rs1(d_inst) and d_inst.rs1 == self.ex_mem.inst.rd)
+                        or (self._uses_rs2(d_inst) and d_inst.rs2 == self.ex_mem.inst.rd)
+                    )
                 ):
                     stall_pipeline = True
                     self.load_use_stalls += 1
@@ -281,31 +334,38 @@ class FiveStagePipelinedCore:
                 if d_inst.is_halt:
                     self.fetch_halted = True
                     next_id_ex = _PipeLatch(valid=True, pc=self.if_id.pc, inst=d_inst)
-                else:
-                    # Read register file (already updated by WB stage this cycle)
-                    rv1 = self._resolve_operand(d_inst.rs1, self.regs[d_inst.rs1])
-                    rv2 = self._resolve_operand(d_inst.rs2, self.regs[d_inst.rs2])
-                    if d_inst.is_branch:
-                        if evaluate_branch(d_inst, rv1, rv2):
-                            branch_redirect_pc = self.if_id.pc + d_inst.imm
-                            self.branch_flushes += 1
-                        next_id_ex = _PipeLatch(valid=True, pc=self.if_id.pc, inst=d_inst, v1=rv1, v2=rv2)
-                    elif d_inst.is_jump:
+                elif d_inst.is_branch:
+                    rv1 = self._resolve_operand(d_inst.rs1, self.regs[d_inst.rs1], from_id_stage=True)
+                    rv2 = self._resolve_operand(d_inst.rs2, self.regs[d_inst.rs2], from_id_stage=True)
+                    if evaluate_branch(d_inst, rv1, rv2):
                         branch_redirect_pc = self.if_id.pc + d_inst.imm
                         self.branch_flushes += 1
-                        next_id_ex = _PipeLatch(valid=True, pc=self.if_id.pc, inst=d_inst, v1=rv1, v2=rv2)
+                    next_id_ex = _PipeLatch(valid=True, pc=self.if_id.pc, inst=d_inst, v1=rv1, v2=rv2)
+                elif d_inst.is_jump:
+                    rv1 = (
+                        self._resolve_operand(d_inst.rs1, self.regs[d_inst.rs1], from_id_stage=True)
+                        if d_inst.opcode == 0x67
+                        else 0
+                    )
+                    if d_inst.opcode == 0x67:
+                        branch_redirect_pc = (to_i32(rv1) + d_inst.imm) & ~1
                     else:
-                        next_id_ex = _PipeLatch(
-                            valid=True,
-                            pc=self.if_id.pc,
-                            inst=d_inst,
-                            v1=self.regs[d_inst.rs1],
-                            v2=self.regs[d_inst.rs2],
-                        )
+                        branch_redirect_pc = self.if_id.pc + d_inst.imm
+                    self.branch_flushes += 1
+                    next_id_ex = _PipeLatch(valid=True, pc=self.if_id.pc, inst=d_inst, v1=rv1, v2=0)
+                else:
+                    next_id_ex = _PipeLatch(
+                        valid=True,
+                        pc=self.if_id.pc,
+                        inst=d_inst,
+                        v1=self.regs[d_inst.rs1],
+                        v2=self.regs[d_inst.rs2],
+                    )
 
             # 5. IF stage
             if branch_redirect_pc is not None:
                 self.pc = branch_redirect_pc
+                self.fetch_halted = False
             if self.fetch_halted:
                 next_if_id = _PipeLatch(valid=False)
             else:

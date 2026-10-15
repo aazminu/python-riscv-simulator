@@ -96,6 +96,10 @@ def encode_b_type(imm: int, rs2: int, rs1: int, funct3: int, opcode: int = 0x63)
     )
 
 
+def encode_u_type(imm20: int, rd: int, opcode: int = 0x37) -> int:
+    return ((imm20 & 0xFFFFF) << 12) | ((rd & 0x1F) << 7) | (opcode & 0x7F)
+
+
 def encode_j_type(imm: int, rd: int, opcode: int = 0x6F) -> int:
     if imm % 2 != 0:
         raise ValueError("J-type immediate must be 2-byte aligned")
@@ -181,11 +185,12 @@ def decode_rv32i(word: int) -> DecodedInstruction:
             reg_write=True,
         )
 
-    if opcode == 0x03:  # Load (LW)
+    if opcode == 0x03:  # Load (LB, LH, LW, LBU, LHU)
         imm = sign_extend((u >> 20) & 0xFFF, 12)
+        load_map = {0x0: "LB", 0x1: "LH", 0x2: "LW", 0x4: "LBU", 0x5: "LHU"}
         return DecodedInstruction(
             raw=u,
-            mnemonic="LW",
+            mnemonic=load_map.get(funct3, "LW"),
             opcode=opcode,
             rd=rd,
             rs1=rs1,
@@ -195,12 +200,13 @@ def decode_rv32i(word: int) -> DecodedInstruction:
             mem_read=True,
         )
 
-    if opcode == 0x23:  # Store (SW)
+    if opcode == 0x23:  # Store (SB, SH, SW)
         imm12 = (funct7 << 5) | rd
         imm = sign_extend(imm12, 12)
+        store_map = {0x0: "SB", 0x1: "SH", 0x2: "SW"}
         return DecodedInstruction(
             raw=u,
-            mnemonic="SW",
+            mnemonic=store_map.get(funct3, "SW"),
             opcode=opcode,
             rs1=rs1,
             rs2=rs2,
@@ -228,6 +234,17 @@ def decode_rv32i(word: int) -> DecodedInstruction:
             is_branch=True,
         )
 
+    if opcode in (0x37, 0x17):  # U-type (LUI, AUIPC)
+        imm = to_u32(u & 0xFFFFF000)
+        return DecodedInstruction(
+            raw=u,
+            mnemonic="LUI" if opcode == 0x37 else "AUIPC",
+            opcode=opcode,
+            rd=rd,
+            imm=imm,
+            reg_write=True,
+        )
+
     if opcode == 0x6F:  # JAL
         b20 = (u >> 31) & 0x1
         b10_1 = (u >> 21) & 0x3FF
@@ -245,6 +262,20 @@ def decode_rv32i(word: int) -> DecodedInstruction:
             is_jump=True,
         )
 
+    if opcode == 0x67:  # JALR
+        imm = sign_extend((u >> 20) & 0xFFF, 12)
+        return DecodedInstruction(
+            raw=u,
+            mnemonic="JALR",
+            opcode=opcode,
+            rd=rd,
+            rs1=rs1,
+            funct3=funct3,
+            imm=imm,
+            reg_write=True,
+            is_jump=True,
+        )
+
     return NOP_INSTRUCTION
 
 
@@ -255,7 +286,11 @@ def execute_alu(inst: DecodedInstruction, op_a: int, op_b: int) -> int:
     b_s = to_i32(b_u)
     m = inst.mnemonic
 
-    if m in ("ADD", "ADDI", "LW", "SW"):
+    if m == "LUI":
+        return b_u
+    if m == "AUIPC":
+        return to_u32(a_s + b_s)
+    if m in ("ADD", "ADDI", "LB", "LH", "LW", "LBU", "LHU", "SB", "SH", "SW"):
         return to_u32(a_s + b_s)
     if m == "SUB":
         return to_u32(a_s - b_s)
