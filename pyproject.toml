@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "python-riscv-simulator"
+version = "0.2.0"
+description = "Cycle-accurate RV32I Single-Cycle and 5-Stage Pipelined RISC-V processor simulator with EX/MEM/WB forwarding, load-use hazard stalling, and architectural state equivalence verification"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
