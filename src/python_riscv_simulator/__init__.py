@@ -8,6 +8,7 @@ from .isa_rv32i import (
     encode_j_type,
     encode_r_type,
     encode_s_type,
+    encode_u_type,
     evaluate_branch,
     execute_alu,
 )
@@ -24,6 +25,7 @@ __all__ = [
     "encode_j_type",
     "encode_r_type",
     "encode_s_type",
+    "encode_u_type",
     "evaluate_branch",
     "execute_alu",
 ]
