@@ -158,3 +158,46 @@ def test_lui_auipc_jalr_and_byte_halfword_memory_parity() -> None:
     assert fs.registers[7] == 0x20
     assert fs.registers[8] == 0
     assert fs.registers[9] == 0x5000
+
+
+def test_cli_benchmark_markdown_json_and_reproducibility(
+    capsys: object, tmp_path: object
+) -> None:
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+    import pytest
+    from python_riscv_simulator.__main__ import format_markdown_table, main, run_benchmark
+
+    rows_1 = run_benchmark(seed=42)
+    rows_2 = run_benchmark(seed=42)
+    assert rows_1 == rows_2
+    assert len(rows_1) == 3
+    assert all(r["architectural_parity"] is True for r in rows_1)
+
+    md = format_markdown_table(rows_1)
+    assert "| benchmark | instructions_retired | pipeline_cycles |" in md
+    assert "load_to_branch_hazard_recovery" in md
+    assert "rv32i_subword_jalr_upper_imm" in md
+
+    out_path = Path(str(tmp_path)) / "riscv_bench.json"
+    rc = main(["--format", "json", "--seed", "42", "--output", str(out_path)])
+    assert rc == 0
+    data = json.loads(capsys.readouterr().out)  # type: ignore[attr-defined]
+    assert data["seed"] == 42
+    assert data["benchmarks"] == rows_1
+    assert json.loads(out_path.read_text(encoding="utf-8")) == data
+
+    repo_root = Path(__file__).resolve().parents[1]
+    proc = subprocess.run(
+        [sys.executable, str(repo_root / "scripts" / "benchmark.py"), "--format", "markdown"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "alu_forwarding_pipeline" in proc.stdout
+
+    with pytest.raises(SystemExit):
+        main(["--format", "invalid_fmt"])
+
