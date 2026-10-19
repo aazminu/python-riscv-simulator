@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
@@ -18,9 +20,10 @@ from .isa_rv32i import (
 
 def run_benchmark(seed: int = 42) -> List[Dict[str, Any]]:
     """Run reproducible RV32I Single-Cycle vs 5-Stage Pipelined Core benchmarks."""
-    _ = seed
+    rng = random.Random(seed)
 
-    # 1. ALU data forwarding + x0 hardwire stress program
+    # 1. ALU data forwarding + x0 hardwire stress program (with seeded ALU chain length)
+    extra_alu_ops = rng.randint(1, 6)
     prog_alu = [
         encode_i_type(15, rs1=0, funct3=0x0, rd=1),
         encode_i_type(27, rs1=0, funct3=0x0, rd=2),
@@ -28,8 +31,11 @@ def run_benchmark(seed: int = 42) -> List[Dict[str, Any]]:
         encode_r_type(0x20, rs2=1, rs1=3, funct3=0x0, rd=4),
         encode_i_type(99, rs1=3, funct3=0x0, rd=0),
         encode_s_type(8, rs2=3, rs1=0),
-        encode_halt(),
     ]
+    for step_idx in range(extra_alu_ops):
+        prog_alu.append(encode_i_type(step_idx + 1, rs1=4, funct3=0x0, rd=5))
+    prog_alu.append(encode_halt())
+
     ss_alu = SingleCycleCore(prog_alu).run()
     fs_alu = FiveStagePipelinedCore(prog_alu).run()
 
@@ -150,8 +156,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         else format_markdown_table(rows)
     )
     if args.output is not None:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(rendered + "\n", encoding="utf-8")
+        try:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(rendered + "\n", encoding="utf-8")
+        except OSError as exc:
+            print(f"Error writing output to {args.output}: {exc}", file=sys.stderr)
+            return 1
     print(rendered)
     return 0
 
