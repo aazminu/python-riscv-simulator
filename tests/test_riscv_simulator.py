@@ -164,6 +164,7 @@ def test_cli_benchmark_markdown_json_and_reproducibility(
     capsys: object, tmp_path: object
 ) -> None:
     import json
+    import os
     import subprocess
     import sys
     from pathlib import Path
@@ -172,7 +173,9 @@ def test_cli_benchmark_markdown_json_and_reproducibility(
 
     rows_1 = run_benchmark(seed=42)
     rows_2 = run_benchmark(seed=42)
+    rows_3 = run_benchmark(seed=99)
     assert rows_1 == rows_2
+    assert rows_1 != rows_3
     assert len(rows_1) == 3
     assert all(r["architectural_parity"] is True for r in rows_1)
 
@@ -189,6 +192,10 @@ def test_cli_benchmark_markdown_json_and_reproducibility(
     assert data["benchmarks"] == rows_1
     assert json.loads(out_path.read_text(encoding="utf-8")) == data
 
+    err_rc = main(["--format", "markdown", "--output", str(tmp_path)])
+    assert err_rc == 1
+    assert "Error writing output" in capsys.readouterr().err  # type: ignore[attr-defined]
+
     repo_root = Path(__file__).resolve().parents[1]
     proc = subprocess.run(
         [sys.executable, str(repo_root / "scripts" / "benchmark.py"), "--format", "markdown"],
@@ -198,6 +205,18 @@ def test_cli_benchmark_markdown_json_and_reproducibility(
     )
     assert "alu_forwarding_pipeline" in proc.stdout
 
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(repo_root / "src")
+    proc_mod = subprocess.run(
+        [sys.executable, "-m", "python_riscv_simulator", "--format", "json", "--seed", "42"],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+    )
+    assert json.loads(proc_mod.stdout)["seed"] == 42
+
     with pytest.raises(SystemExit):
         main(["--format", "invalid_fmt"])
+
 
